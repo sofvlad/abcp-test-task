@@ -2,6 +2,13 @@
 
 namespace NW\WebService\References\Operations\Notification;
 
+use Exception;
+
+/**
+ * Назначение кода: Отправка Email и/или SMS работникам, продавцам и клиенту
+ * Качество: Трудночитаемый код. Присутствуют непонятные моменты в коде, а также неиспользуемый код. Использование статичных методов. Нагромождение метода doOperation().
+ * Итог: Выведены части логики в отдельные методы, помечен и закомментирован неиспользуемый код, рефакторинг.
+ */
 class TsReturnOperation extends ReferencesOperation
 {
     public const TYPE_NEW    = 1;
@@ -10,130 +17,176 @@ class TsReturnOperation extends ReferencesOperation
     /**
      * @throws \Exception
      */
-    public function doOperation(): void
+    public function doOperation(): OperationResultInterface
     {
         $data = (array)$this->getRequest('data');
-        $resellerId = $data['resellerId'];
+        $resellerId = (int)$data['resellerId'];
         $notificationType = (int)$data['notificationType'];
-        $result = [
-            'notificationEmployeeByEmail' => false,
-            'notificationClientByEmail'   => false,
-            'notificationClientBySms'     => [
-                'isSent'  => false,
-                'message' => '',
-            ],
-        ];
+        $result = new OperationResult();
 
-        if (empty((int)$resellerId)) {
-            $result['notificationClientBySms']['message'] = 'Empty resellerId';
+        if (empty($resellerId)) {
+            $result['notificationClientBySms']['message'] = 'Empty reseller id';
+
             return $result;
         }
 
-        if (empty((int)$notificationType)) {
-            throw new \Exception('Empty notificationType', 400);
+        if (empty($notificationType)) {
+            throw new Exception('Empty notification type', 400);
         }
 
-        $reseller = Seller::getById((int)$resellerId);
-        if ($reseller === null) {
-            throw new \Exception('Seller not found!', 400);
+        // Неиспользуемый код
+        // $reseller = $this->contractorLoader->getById($resellerId, Seller::TYPE);
+        // if ($reseller === null) {
+        //     throw new Exception('Seller not found!', 400);
+        // }
+
+        $client = $this->contractorLoader->getById((int)$data['clientId'], Customer::TYPE);
+        // $client->Seller->id ?
+        if ($client->Seller->id !== $resellerId) {
+            throw new \Exception('Client not found!', 400);
         }
 
-        $client = Contractor::getById((int)$data['clientId']);
-        if ($client === null || $client->type !== Contractor::TYPE_CUSTOMER || $client->Seller->id !== $resellerId) {
-            throw new \Exception('сlient not found!', 400);
-        }
+        $templateData = $this->prepareTemplate($data, $client, $notificationType, $resellerId);
 
-        $cFullName = $client->getFullName();
-        if (empty($client->getFullName())) {
-            $cFullName = $client->name;
-        }
-
-        $cr = Employee::getById((int)$data['creatorId']);
-        if ($cr === null) {
-            throw new \Exception('Creator not found!', 400);
-        }
-
-        $et = Employee::getById((int)$data['expertId']);
-        if ($et === null) {
-            throw new \Exception('Expert not found!', 400);
-        }
-
-        $differences = '';
-        if ($notificationType === self::TYPE_NEW) {
-            $differences = __('NewPositionAdded', null, $resellerId);
-        } elseif ($notificationType === self::TYPE_CHANGE && !empty($data['differences'])) {
-            $differences = __('PositionStatusHasChanged', [
-                    'FROM' => Status::getName((int)$data['differences']['from']),
-                    'TO'   => Status::getName((int)$data['differences']['to']),
-                ], $resellerId);
-        }
-
-        $templateData = [
-            'COMPLAINT_ID'       => (int)$data['complaintId'],
-            'COMPLAINT_NUMBER'   => (string)$data['complaintNumber'],
-            'CREATOR_ID'         => (int)$data['creatorId'],
-            'CREATOR_NAME'       => $cr->getFullName(),
-            'EXPERT_ID'          => (int)$data['expertId'],
-            'EXPERT_NAME'        => $et->getFullName(),
-            'CLIENT_ID'          => (int)$data['clientId'],
-            'CLIENT_NAME'        => $cFullName,
-            'CONSUMPTION_ID'     => (int)$data['consumptionId'],
-            'CONSUMPTION_NUMBER' => (string)$data['consumptionNumber'],
-            'AGREEMENT_NUMBER'   => (string)$data['agreementNumber'],
-            'DATE'               => (string)$data['date'],
-            'DIFFERENCES'        => $differences,
-        ];
-
-        // Если хоть одна переменная для шаблона не задана, то не отправляем уведомления
-        foreach ($templateData as $key => $tempData) {
-            if (empty($tempData)) {
-                throw new \Exception("Template Data ({$key}) is empty!", 500);
-            }
-        }
-
-        $emailFrom = getResellerEmailFrom($resellerId);
-        // Получаем email сотрудников из настроек
-        $emails = getEmailsByPermit($resellerId, 'tsGoodsReturn');
-        if (!empty($emailFrom) && count($emails) > 0) {
-            foreach ($emails as $email) {
-                MessagesClient::sendMessage([
-                    0 => [ // MessageTypes::EMAIL
-                           'emailFrom' => $emailFrom,
-                           'emailTo'   => $email,
-                           'subject'   => __('complaintEmployeeEmailSubject', $templateData, $resellerId),
-                           'message'   => __('complaintEmployeeEmailBody', $templateData, $resellerId),
-                    ],
-                ], $resellerId, NotificationEvents::CHANGE_RETURN_STATUS);
-                $result['notificationEmployeeByEmail'] = true;
-
-            }
+        $emailFrom = $this->helper->getResellerEmailFrom($resellerId);
+        if (!empty($emailFrom)) {
+            $result['notificationEmployeeByEmail'] = $this->sendMessagesToEmployees($resellerId, $emailFrom, $templateData);
         }
 
         // Шлём клиентское уведомление, только если произошла смена статуса
-        if ($notificationType === self::TYPE_CHANGE && !empty($data['differences']['to'])) {
-            if (!empty($emailFrom) && !empty($client->email)) {
-                MessagesClient::sendMessage([
-                    0 => [ // MessageTypes::EMAIL
-                           'emailFrom' => $emailFrom,
-                           'emailTo'   => $client->email,
-                           'subject'   => __('complaintClientEmailSubject', $templateData, $resellerId),
-                           'message'   => __('complaintClientEmailBody', $templateData, $resellerId),
-                    ],
-                ], $resellerId, $client->id, NotificationEvents::CHANGE_RETURN_STATUS, (int)$data['differences']['to']);
-                $result['notificationClientByEmail'] = true;
-            }
+        if ($notificationType !== self::TYPE_CHANGE || empty($data['differences']['to'])) {
+            return $result;
+        }
 
-            if (!empty($client->mobile)) {
-                $res = NotificationManager::send($resellerId, $client->id, NotificationEvents::CHANGE_RETURN_STATUS, (int)$data['differences']['to'], $templateData, $error);
-                if ($res) {
-                    $result['notificationClientBySms']['isSent'] = true;
-                }
-                if (!empty($error)) {
-                    $result['notificationClientBySms']['message'] = $error;
-                }
+        if (!empty($client->email)) {
+            // Не раскрыто назначение MessageTypes и цель использования многих параметров метода sendMessage
+            $this->messagesClient->sendMessage(
+                [
+                    0 => [ // MessageTypes::EMAIL
+                       'emailFrom' => $emailFrom,
+                       'emailTo'   => $client->email,
+                       'subject'   => __('complaintClientEmailSubject', $templateData, $resellerId),
+                       'message'   => __('complaintClientEmailBody', $templateData, $resellerId),
+                    ],
+                ], 
+                $resellerId,
+                $client->id,
+                NotificationEvents::CHANGE_RETURN_STATUS,
+                (int)$data['differences']['to']
+            );
+            $result['notificationClientByEmail'] = true;
+        }
+
+        if (!empty($client->mobile)) {
+            $notificationResult = $this->notificationManager->send(
+                $resellerId,
+                $client->id,
+                NotificationEvents::CHANGE_RETURN_STATUS,
+                (int)$data['differences']['to'],
+                $templateData
+            );
+            if ($notificationResult) {
+                $result['notificationClientBySms']['isSent'] = true;
+            }
+            if (!empty($notificationResult['error'])) {
+                $result['notificationClientBySms']['message'] = $notificationResult['error'];
             }
         }
 
         return $result;
+    }
+
+    /**
+     * Validate for the fullness of the template data
+     * 
+     * @param array $templateData
+     * 
+     * @return void
+     * 
+     * @throws Exception
+     */
+    protected function validateTemplateData(array $templateData): void
+    {
+        foreach ($templateData as $key => $value) {
+            if (empty($value) || (is_string($value) && empty(trim($value)))) {
+                throw new Exception(sprintf('Template Data "%s" is empty!', $key), 400);
+            }
+        }
+    }
+
+    /**
+     * Send messages to employees by reseller id
+     * 
+     * @param int $resellerId
+     * @param string $emailFrom
+     * @param array $templateData
+     * 
+     * @return bool
+     */
+    protected function sendMessagesToEmployees(int $resellerId, string $emailFrom, array $templateData): bool
+    {
+        $notificationEmployeeByEmail = false;
+        foreach ($this->helper->getEmailsByPermit($resellerId, 'tsGoodsReturn') as $email) {
+            $success = $this->messagesClient->sendMessage(
+                [
+                    0 => [ // MessageTypes::EMAIL
+                       'emailFrom' => $emailFrom,
+                       'emailTo'   => $email,
+                       'subject'   => __('complaintEmployeeEmailSubject', $templateData, $resellerId),
+                       'message'   => __('complaintEmployeeEmailBody', $templateData, $resellerId),
+                    ],
+                ],
+                $resellerId,
+                NotificationEvents::CHANGE_RETURN_STATUS
+            );
+            if (!empty($success)) {
+                $notificationEmployeeByEmail = true;
+            }
+        }
+
+        return $notificationEmployeeByEmail;
+    }
+
+    /**
+     * Prepare template data
+     * 
+     * @param array $data
+     * @param Customer $client
+     */
+    protected function prepareTemplate(array $data, Customer $client, int $notificationType, int $resellerId)
+    {
+        // Непонятна реализация через магические методы __() и цель использования
+        if ($notificationType === self::TYPE_NEW) {
+            $differences = __('NewPositionAdded', null, $resellerId);
+        } elseif ($notificationType === self::TYPE_CHANGE && !empty($data['differences'])) {
+            $differences = __('PositionStatusHasChanged', [
+                'FROM' => Status::STATUS_MAP[(int)$data['differences']['from']],
+                'TO'   => Status::STATUS_MAP[(int)$data['differences']['to']],
+            ], $resellerId);
+        }
+
+        $creator = $this->contractorLoader->getById((int)$data['creatorId'], Employee::TYPE);
+        $expert = $this->contractorLoader->getById((int)$data['expertId'], Employee::TYPE);
+
+        // @TODO Передалать в объект как OperationResult
+        $templateData = [
+            'COMPLAINT_ID'       => (int)$data['complaintId'],
+            'COMPLAINT_NUMBER'   => (string)$data['complaintNumber'],
+            'CREATOR_ID'         => (int)$data['creatorId'],
+            'CREATOR_NAME'       => $creator->getFullName(),
+            'EXPERT_ID'          => (int)$data['expertId'],
+            'EXPERT_NAME'        => $expert->getFullName(),
+            'CLIENT_ID'          => (int)$data['clientId'],
+            'CLIENT_NAME'        => $client->getFullName(),
+            'CONSUMPTION_ID'     => (int)$data['consumptionId'],
+            'CONSUMPTION_NUMBER' => (string)$data['consumptionNumber'],
+            'AGREEMENT_NUMBER'   => (string)$data['agreementNumber'],
+            'DATE'               => (string)$data['date'],
+            'DIFFERENCES'        => $differences ?? '',
+        ];
+
+        $this->validateTemplateData($templateData);
+
+        return $data;
     }
 }
